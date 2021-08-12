@@ -1,7 +1,27 @@
 #!/bin/sh
 set -e
 
-if [ -z "$1" ]; then
+while [ $# -gt 0 ]; do
+  key=$1
+
+  case $key in
+    --skip_openssl)
+      SKIP_OPENSSL=1
+      shift
+      ;;
+    --cxxobf)
+      CXXOBF=$2
+      shift
+      shift
+      ;;
+    *)
+      VERSION=$1
+      shift
+      ;;
+  esac
+done
+
+if [ -z "${VERSION}" ]; then
     echo "Usage: $0 <CURL Version>"
     exit 1
 fi
@@ -10,11 +30,10 @@ fi
 # DOWNLOAD #
 ############
 
-VERSION=$1
 ARCHIVE=curl.tar.gz
 if [ ! -f "${ARCHIVE}" ]; then
     echo "Downloading curl ${VERSION}"
-    curl "https://curl.haxx.se/download/curl-${VERSION}.tar.gz" > "${ARCHIVE}"
+    curl -L "https://curl.se/download/curl-${VERSION}.tar.gz" > "${ARCHIVE}"
 fi
 
 ###########
@@ -25,6 +44,8 @@ export OUTDIR=output
 export BUILDDIR=build
 export IPHONEOS_DEPLOYMENT_TARGET="9.3"
 
+ROOTDIR="${PWD}"
+
 function build() {
     ARCH=$1
     HOST=$2
@@ -34,7 +55,7 @@ function build() {
 
     WORKDIR=curl_${ARCH}
     mkdir "${WORKDIR}"
-    tar -xzf "../${ARCHIVE}" -C "${WORKDIR}" --strip-components 1
+    tar -xzf "${ROOTDIR}/${ARCHIVE}" -C "${WORKDIR}" --strip-components 1
     cd "${WORKDIR}"
 
     for FILE in $(find ../../patches -name '*.patch'); do
@@ -43,10 +64,11 @@ function build() {
 
     unset CFLAGS
     unset LDFLAGS
-    CFLAGS="-arch ${ARCH} -pipe -Os -gdwarf-2 -isysroot ${SDKDIR} -I${SDKDIR}/usr/include -miphoneos-version-min=${IPHONEOS_DEPLOYMENT_TARGET} -fembed-bitcode"
+    CFLAGS="-arch ${ARCH} -pipe -Os -gdwarf-2 -isysroot ${SDKDIR} -I${SDKDIR}/usr/include -miphoneos-version-min=${IPHONEOS_DEPLOYMENT_TARGET} -DHAVE_OPENSSL_ENGINE_H=1 -DUSE_OPENSSL_ENGINE"
     LDFLAGS="-arch ${ARCH} -isysroot ${SDKDIR}"
     export CFLAGS
     export LDFLAGS
+    autoreconf -fi >> "${LOG}" 2>&1
     ./configure --host="${HOST}-apple-darwin" \
        --disable-shared \
        --enable-static \
@@ -58,31 +80,67 @@ function build() {
        --disable-telnet \
        --disable-rtsp \
        --disable-ldap \
-       --with-darwinssl > "${LOG}" 2>&1
-    make -j`sysctl -n hw.logicalcpu_max` >> "${LOG}" 2>&1
-    cp lib/.libs/libcurl.a ../../$OUTDIR/libcurl-${ARCH}.a
+       --with-openssl=${ROOTDIR}/${OUTDIR}/${ARCH}/openssl \
+       --without-zlib \
+       --without-librtmp \
+       --without-libidn \
+       --disable-hidden-symbols \
+       --disable-versioned-symbols \
+       --without-brotli \
+       --without-libidn2 \
+       --without-nghttp2 \
+       --without-libpsl >> "${LOG}" 2>&1
+    # cp -r $ROOTDIR/user-exceptions.txt ./user-exceptions.txt
+
+    # cp -r $ROOTDIR/build-script.pl ./build-script.pl
+    mkdir -p ${ROOTDIR}/${BUILDDIR}/isolated_${WORKDIR}
+    find . -type f -name "*.h" -or -name "*.c" >> files.list
+    ${CXXOBF}/bin/cxx-obfus -x $ROOTDIR/user-exceptions.txt -x cpp -x iso -x motif -x posix2 -x stl -x unix95 -x x5 -x xpg4 -N none -n none -s none -i prefix,str=ISOLATED -S multifile,outdir=${ROOTDIR}/${BUILDDIR}/isolated_${WORKDIR},indir=${ROOTDIR}/${BUILDDIR}/${WORKDIR},filelist=./files.list
+    # perl ./build-script.pl --op rebuildall --override-input-directory .
+
+    # cp -rf ${ROOTDIR}/${BUILDDIR}/isolated_${WORKDIR}/* ${ROOTDIR}/${BUILDDIR}/${WORKDIR}/
+    # make -j`sysctl -n hw.logicalcpu_max` >> "${LOG}" 2>&1
+
+    mkdir -p ../../$OUTDIR/${ARCH}/curl/
+    cp lib/.libs/libcurl.a ../../$OUTDIR/${ARCH}/curl/libcurl.a
     cd ../
 }
 
-rm -rf $OUTDIR $BUILDDIR
-mkdir $OUTDIR
+# rm -rf $OUTDIR 
+rm -rf $BUILDDIR
+mkdir -p $OUTDIR
 mkdir $BUILDDIR
+
+# ###########
+# # OPENSSL #
+# ###########
+# if ! [ -z $SKIP_OPENSSL ]; then
+#     rm -f openssl-build-ios.sh
+#     curl "https://raw.githubusercontent.com/kartaris/openssl-ios/master/build-ios.sh" > openssl-build-ios.sh
+#     bash openssl-build-ios.sh 1.1.1d
+# fi
+
+mkdir -p $BUILDDIR
 cd $BUILDDIR
 
-build armv7    armv7   `xcrun --sdk iphoneos --show-sdk-path`
-build armv7s   armv7s  `xcrun --sdk iphoneos --show-sdk-path`
-build arm64    arm     `xcrun --sdk iphoneos --show-sdk-path`
-build x86_64   x86_64  `xcrun --sdk iphonesimulator --show-sdk-path`
+build armv7    armv7   $(xcrun --sdk iphoneos --show-sdk-path)
+build arm64    arm64   $(xcrun --sdk iphoneos --show-sdk-path)
+build x86_64   x86_64  $(xcrun --sdk iphonesimulator --show-sdk-path)
 
 cd ../
 
 rm ${ARCHIVE}
 
-lipo -arch armv7 $OUTDIR/libcurl-armv7.a \
-   -arch armv7s $OUTDIR/libcurl-armv7s.a \
-   -arch arm64 $OUTDIR/libcurl-arm64.a \
-   -arch x86_64 $OUTDIR/libcurl-x86_64.a \
-   -create -output $OUTDIR/libcurl_all.a
+mkdir -p $OUTDIR/armv7/curl/
+mkdir -p $OUTDIR/arm64/curl/
+mkdir -p $OUTDIR/x86_64/curl/
+mkdir -p $OUTDIR/combined/curl/
+
+lipo \
+   -arch x86_64 $OUTDIR/x86_64/curl/libcurl.a \
+   -arch armv7 $OUTDIR/armv7/curl/libcurl.a \
+   -arch arm64 $OUTDIR/arm64/curl/libcurl.a \
+   -create -output $OUTDIR/combined/curl/libcurl.a
 
 ###########
 # PACKAGE #
@@ -98,12 +156,12 @@ fi
 LIBTOOL_FLAGS="-static"
 
 echo "Creating $FWNAME.framework"
-mkdir -p $FWNAME.framework/Headers
-libtool -no_warning_for_no_symbols $LIBTOOL_FLAGS -o $FWNAME.framework/$FWNAME $OUTDIR/libcurl_all.a
-cp -r $BUILDDIR/curl_arm64/include/$FWNAME/*.h $FWNAME.framework/Headers/
+mkdir -p $FWNAME.framework/Headers/openssl
+libtool -no_warning_for_no_symbols $LIBTOOL_FLAGS -o $FWNAME.framework/$FWNAME $OUTDIR/combined/curl/libcurl.a 
+cp -r $BUILDDIR/curl_x86_64/include/$FWNAME/*.h $FWNAME.framework/Headers/
 
 rm -rf $BUILDDIR
-rm -rf $OUTDIR
+# rm -rf $OUTDIR
 
 cp "Info.plist" $FWNAME.framework/Info.plist
 
